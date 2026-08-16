@@ -1,0 +1,408 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <TFT_eSPI.h>
+#include <U8g2_for_TFT_eSPI.h>
+#include <driver/i2s.h>
+#include <Preferences.h>
+
+const char* ssid = "SergeyV";
+const char* password = "NataliaAndSergey0511";
+const char* ollama_url = "http://192.168.1.106:11434/api/generate";
+const char* whisper_url = "http://192.168.1.106:5000/transcribe";
+
+#define I2S_WS   5
+#define I2S_SCK  6
+#define I2S_SD   4
+#define SAMPLE_RATE 16000
+#define RECORD_SECONDS 4
+#define RECORD_SAMPLES (SAMPLE_RATE * RECORD_SECONDS)
+
+TFT_eSPI tft = TFT_eSPI();
+TFT_eSprite canvas = TFT_eSprite(&tft);
+U8g2_for_TFT_eSPI u8f;
+Preferences prefs;
+uint16_t calData[5] = {398, 3365, 384, 3244, 4};
+
+#define SCR_W 320
+#define SCR_H 240
+#define HEADER_H 28
+#define FOOTER_H 40
+#define CHAT_TOP HEADER_H
+#define CHAT_BOTTOM (SCR_H - FOOTER_H)
+
+bool darkTheme = true;
+uint16_t COL_BG, COL_USER_BUBBLE, COL_AI_BUBBLE, COL_USER_TEXT, COL_AI_TEXT, COL_ACCENT, COL_BTN;
+
+#define MAX_MSGS 12
+struct Msg { String text; bool isUser; };
+Msg messages[MAX_MSGS];
+int msgCount = 0;
+
+int scrollY = 0;
+int contentH = 0;
+float velocity = 0;
+
+int16_t* audioBuffer = NULL;
+String lastQuestion = ""; // снова вопрос
+int likeCount = 0; // stats like
+
+void applyTheme() {
+  if (darkTheme) {
+    COL_BG = tft.color565(18,18,20);
+    COL_USER_BUBBLE = tft.color565(40,100,220);
+    COL_AI_BUBBLE = tft.color565(44,44,50);
+    COL_USER_TEXT = TFT_WHITE;
+    COL_AI_TEXT = tft.color565(235,235,240);
+    COL_ACCENT = tft.color565(70,140,250);
+    COL_BTN = tft.color565(35,35,42);
+  } else {
+    COL_BG = tft.color565(244,244,247);
+    COL_USER_BUBBLE = tft.color565(50,120,240);
+    COL_AI_BUBBLE = tft.color565(228,228,233);
+    COL_USER_TEXT = TFT_WHITE;
+    COL_AI_TEXT = tft.color565(20,20,25);
+    COL_ACCENT = tft.color565(40,110,230);
+    COL_BTN = tft.color565(225,225,230);
+  }
+}
+
+void initMic() {
+  i2s_config_t cfg = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = 0,
+    .dma_buf_count = 8,
+    .dma_buf_len = 256,
+    .use_apll = false
+  };
+  i2s_pin_config_t pins = {
+    .bck_io_num = I2S_SCK, .ws_io_num = I2S_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE, .data_in_num = I2S_SD
+  };
+  i2s_driver_install(I2S_NUM_0, &cfg, 0, NULL);
+  i2s_set_pin(I2S_NUM_0, &pins);
+}
+
+int wrapText(String text, int maxW, String out[], int maxLines) {
+  u8f.setFont(u8g2_font_9x15_t_cyrillic);
+  int n = 0;
+  if (text.length() == 0) { out[0] = ""; return 1; }
+  String line = "";
+  int i = 0;
+  while (i < text.length() && n < maxLines) {
+    int sp = text.indexOf(' ', i);
+    String word = (sp == -1) ? text.substring(i) : text.substring(i, sp);
+    String test = (line == "") ? word : line + " " + word;
+    if (u8f.getUTF8Width(test.c_str()) > maxW && line != "") {
+      out[n++] = line; line = word;
+    } else line = test;
+    i = (sp == -1) ? text.length() : sp + 1;
+  }
+  if (line != "" && n < maxLines) out[n++] = line;
+  return n;
+}
+
+int bubbleHeight(String text, int textW) {
+  String lines[30];
+  int n = wrapText(text, textW, lines, 30);
+  return n * 18 + 16;
+}
+
+void drawButton(int x, int w, String label) {
+  int y = SCR_H - FOOTER_H + 4;
+  canvas.fillRoundRect(x, y, w, FOOTER_H - 8, 8, COL_BTN);
+  u8f.setFont(u8g2_font_9x15_t_cyrillic);
+  uint16_t tc = darkTheme ? TFT_WHITE : tft.color565(20,20,25);
+  u8f.setForegroundColor(tc);
+  u8f.setBackgroundColor(COL_BTN);
+  int tw = u8f.getUTF8Width(label.c_str());
+  u8f.setCursor(x + (w - tw)/2, y + 22);
+  u8f.print(label);
+}
+
+void render() {
+  canvas.fillSprite(COL_BG);
+  u8f.setFontMode(1);
+  int textW = 220;
+  int y = CHAT_TOP + 10 - scrollY;
+
+  for (int i = 0; i < msgCount; i++) {
+    int bubbleW = 250;
+    int bh = bubbleHeight(messages[i].text, textW);
+    int x = messages[i].isUser ? (SCR_W - bubbleW - 10) : 10;
+    if (y + bh > CHAT_TOP && y < CHAT_BOTTOM) {
+      uint16_t bc = messages[i].isUser ? COL_USER_BUBBLE : COL_AI_BUBBLE;
+      uint16_t tc = messages[i].isUser ? COL_USER_TEXT : COL_AI_TEXT;
+      canvas.fillRoundRect(x, y, bubbleW, bh, 10, bc);
+      String lines[30];
+      int n = wrapText(messages[i].text, textW, lines, 30);
+      u8f.setForegroundColor(tc);
+      u8f.setBackgroundColor(bc);
+      for (int l = 0; l < n; l++) {
+        u8f.setCursor(x + 12, y + 20 + l * 18);
+        u8f.print(lines[l]);
+      }
+    }
+    y += bh + 8;
+  }
+  contentH = y + scrollY - CHAT_TOP;
+
+  // башка
+  canvas.fillRect(0, 0, SCR_W, HEADER_H, COL_ACCENT);
+  u8f.setForegroundColor(TFT_WHITE);
+  u8f.setBackgroundColor(COL_ACCENT);
+  u8f.setFont(u8g2_font_9x15_t_cyrillic);
+  u8f.setCursor(10, 19);
+  u8f.print("Барс");
+  String stat = "лайков: " + String(likeCount);
+  int sw = u8f.getUTF8Width(stat.c_str());
+  u8f.setCursor(SCR_W - sw - 30, 19);
+  u8f.print(stat);
+  canvas.fillCircle(305, 14, 7, TFT_WHITE);
+  canvas.fillCircle(305, 14, 4, COL_ACCENT);
+
+  // нижняя панель кнопок
+  canvas.fillRect(0, SCR_H - FOOTER_H, SCR_W, FOOTER_H, COL_BG);
+  drawButton(6,   150, "Говорить");
+  drawButton(162,  70, "Лайк");
+  drawButton(238,  76, "Переспр");
+
+  canvas.pushSprite(0, 0);
+}
+
+int visibleChatH() { return CHAT_BOTTOM - CHAT_TOP; }
+int maxScrollValue() {
+  int m = contentH - visibleChatH() + 20;
+  return (m < 0) ? 0 : m;
+}
+void scrollToBottom() { scrollY = maxScrollValue(); }
+
+void addMessage(String text, bool isUser) {
+  if (msgCount >= MAX_MSGS) {
+    for (int i = 0; i < MAX_MSGS - 1; i++) messages[i] = messages[i + 1];
+    msgCount = MAX_MSGS - 1;
+  }
+  messages[msgCount].text = text;
+  messages[msgCount].isUser = isUser;
+  msgCount++;
+  render();
+  scrollToBottom();
+  render();
+}
+
+void showStatus(String txt) {
+  render();
+  int w = 200, h = 40;
+  int x = (SCR_W - w)/2, y = (SCR_H - h)/2;
+  canvas.fillRoundRect(x, y, w, h, 10, COL_ACCENT);
+  u8f.setFont(u8g2_font_9x15_t_cyrillic);
+  u8f.setForegroundColor(TFT_WHITE);
+  u8f.setBackgroundColor(COL_ACCENT);
+  int tw = u8f.getUTF8Width(txt.c_str());
+  u8f.setCursor(x + (w - tw)/2, y + 25);
+  u8f.print(txt);
+  canvas.pushSprite(0, 0);
+}
+
+void recordAudio() {
+  showStatus("Говорите...");
+  size_t br = 0;
+  int32_t s32;
+  for (int i = 0; i < RECORD_SAMPLES; i++) {
+    i2s_read(I2S_NUM_0, &s32, sizeof(s32), &br, portMAX_DELAY);
+    audioBuffer[i] = (int16_t)(s32 >> 14);
+  }
+}
+
+String sendToWhisper() {
+  showStatus("Распознаю...");
+  int dataSize = RECORD_SAMPLES * 2;
+  int fileSize = 44 + dataSize;
+  uint8_t header[44];
+  memcpy(header, "RIFF", 4);
+  *(int*)(header+4) = fileSize - 8;
+  memcpy(header+8, "WAVE", 4);
+  memcpy(header+12, "fmt ", 4);
+  *(int*)(header+16) = 16;
+  *(short*)(header+20) = 1;
+  *(short*)(header+22) = 1;
+  *(int*)(header+24) = SAMPLE_RATE;
+  *(int*)(header+28) = SAMPLE_RATE * 2;
+  *(short*)(header+32) = 2;
+  *(short*)(header+34) = 16;
+  memcpy(header+36, "data", 4);
+  *(int*)(header+40) = dataSize;
+
+  uint8_t* wav = (uint8_t*)ps_malloc(fileSize);
+  memcpy(wav, header, 44);
+  memcpy(wav + 44, audioBuffer, dataSize);
+
+  HTTPClient http;
+  http.begin(whisper_url);
+  http.setTimeout(30000);
+  String boundary = "----ESP32Boundary";
+  http.addHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
+  String head = "--" + boundary + "\r\n";
+  head += "Content-Disposition: form-data; name=\"audio\"; filename=\"rec.wav\"\r\n";
+  head += "Content-Type: audio/wav\r\n\r\n";
+  String tail = "\r\n--" + boundary + "--\r\n";
+  int totalLen = head.length() + fileSize + tail.length();
+  uint8_t* body = (uint8_t*)ps_malloc(totalLen);
+  int pos = 0;
+  memcpy(body+pos, head.c_str(), head.length()); pos += head.length();
+  memcpy(body+pos, wav, fileSize); pos += fileSize;
+  memcpy(body+pos, tail.c_str(), tail.length()); pos += tail.length();
+  int code = http.POST(body, totalLen);
+  String result = "";
+  if (code == 200) {
+    String resp = http.getString();
+    int start = resp.indexOf("\"text\":\"") + 8;
+    int end = resp.indexOf("\"", start);
+    result = resp.substring(start, end);
+  }
+  http.end();
+  free(wav); free(body);
+  return result;
+}
+
+void askAI(String question) {
+  lastQuestion = question;
+  addMessage(question, true);
+  addMessage("Барс думает...", false);
+  HTTPClient http;
+  http.begin(ollama_url);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(30000);
+  String body = "{\"model\":\"qwen2.5:3b\",\"prompt\":\"" + question + "\",\"stream\":false}";
+  int code = http.POST(body);
+  msgCount--;
+  if (code == 200) {
+    String response = http.getString();
+    int start = response.indexOf("\"response\":\"") + 12;
+    int end = response.indexOf("\",\"done\"", start);
+    String answer = response.substring(start, end);
+    answer.replace("\\n", " ");
+    answer.replace("\\\"", "\"");
+    addMessage(answer, false);
+  } else {
+    addMessage("Ошибка ИИ (" + String(code) + ")", false);
+  }
+  http.end();
+}
+
+void voiceInteraction() {
+  recordAudio();
+  String text = sendToWhisper();
+  if (text.length() > 0) askAI(text);
+  else addMessage("Не расслышал, повтори", false);
+}
+
+void doLike() {
+  likeCount++;
+  prefs.putInt("likes", likeCount); // сохранил в пизду
+  showStatus("Спасибо! +1");
+  delay(600);
+  render();
+}
+
+void doAgain() {
+  if (lastQuestion.length() > 0) {
+    askAI(lastQuestion + " (ответь иначе, другими словами)");
+  } else {
+    showStatus("Нет вопроса");
+    delay(600);
+    render();
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  tft.init();
+  tft.setRotation(1);
+  tft.setTouch(calData);
+  applyTheme();
+
+  prefs.begin("bars", false);
+  likeCount = prefs.getInt("likes", 0);   // читаем статистику
+
+  canvas.setColorDepth(16);
+  canvas.createSprite(SCR_W, SCR_H);
+  u8f.begin(canvas);
+  u8f.setFontMode(1);
+
+  audioBuffer = (int16_t*)ps_malloc(RECORD_SAMPLES * sizeof(int16_t));
+  if (!audioBuffer) { tft.fillScreen(TFT_RED); Serial.println("Нет памяти на аудио"); return; }
+  initMic();
+
+  canvas.fillSprite(COL_BG);
+  u8f.setForegroundColor(TFT_WHITE);
+  u8f.setBackgroundColor(COL_BG);
+  u8f.setFont(u8g2_font_9x15_t_cyrillic);
+  u8f.setCursor(10, 40);
+  u8f.print("Подключаюсь...");
+  canvas.pushSprite(0, 0);
+
+  WiFi.begin(ssid, password);
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 30) { delay(500); tries++; }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi OK: " + WiFi.localIP().toString());
+    addMessage("Привет! Я Барс. Жми «Говорить» и спрашивай.", false);
+  } else {
+    tft.fillScreen(TFT_RED);
+  }
+}
+
+int lastTouchY = -1, touchStartY = -1, touchStartX = -1;
+bool wasTouching = false, movedFar = false;
+
+void loop() {
+  uint16_t tx, ty;
+  bool touching = tft.getTouch(&tx, &ty);
+
+  if (touching) {
+    if (!wasTouching) {
+      lastTouchY = ty; touchStartY = ty; touchStartX = tx;
+      wasTouching = true; movedFar = false; velocity = 0;
+      // кнопка темы
+      if (tx > 292 && ty < HEADER_H) {
+        darkTheme = !darkTheme; applyTheme(); render();
+        delay(250); wasTouching = false; return;
+      }
+    } else {
+      // скролл только внутри области чата
+      if (touchStartY > CHAT_TOP && touchStartY < CHAT_BOTTOM) {
+        int dy = lastTouchY - ty;
+        if (abs(ty - touchStartY) > 6) movedFar = true;
+        if (abs(dy) > 1) {
+          scrollY += dy; velocity = dy;
+          if (scrollY < 0) scrollY = 0;
+          if (scrollY > maxScrollValue()) scrollY = maxScrollValue();
+          render(); lastTouchY = ty;
+        }
+      }
+    }
+  } else {
+    if (wasTouching) {
+      wasTouching = false;
+      Serial.printf("Отпустил: tx=%d ty=%d touchStartY=%d movedFar=%d\n",
+                    tx, ty, touchStartY, movedFar);
+      if (!movedFar && touchStartY >= CHAT_BOTTOM - 5) {
+        if (touchStartX >= 6 && touchStartX < 156) { voiceInteraction(); return; }
+        else if (touchStartX >= 162 && touchStartX < 232) { doLike(); return; }
+        else if (touchStartX >= 238 && touchStartX < 320) { doAgain(); return; }
+      }
+    }
+    // плавная инерция
+    if (abs(velocity) > 0.3) {
+      scrollY += (int)velocity; velocity *= 0.92;
+      if (scrollY < 0) { scrollY = 0; velocity = 0; }
+      if (scrollY > maxScrollValue()) { scrollY = maxScrollValue(); velocity = 0; }
+      render(); delay(12);
+    }
+  }
+}
